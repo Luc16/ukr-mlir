@@ -1,0 +1,9 @@
+a.out
+.venv
+*.log
+tmp/
+build/
+.cache/
+compile_commands.json
+external/
+.DS_Store
