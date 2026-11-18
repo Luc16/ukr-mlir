@@ -1,15 +1,29 @@
 import sys
 
-if len(sys.argv) < 5:
-    print("Usage: python script.py <mr> <nr> <elem_type> <arch> [layout] [out_type]")
+# Options: --alpha=one|dynamic, --beta=zero|one|dynamic, --edges=true|false
+opts = {"alpha": "dynamic", "beta": "dynamic", "edges": "true"}
+args = []
+for arg in sys.argv[1:]:
+    if arg.startswith("--"):
+        key, _, val = arg[2:].partition("=")
+        if key not in opts:
+            print(f"Unknown option: {arg}")
+            sys.exit(1)
+        opts[key] = val
+    else:
+        args.append(arg)
+
+if len(args) < 4:
+    print("Usage: python script.py <mr> <nr> <elem_type> <arch> [layout] [out_type] "
+          "[--alpha=one|dynamic] [--beta=zero|one|dynamic] [--edges=true|false]")
     sys.exit(1)
 
-mr = int(sys.argv[1])
-nr = int(sys.argv[2])
-elem_type = sys.argv[3]
-arch = sys.argv[4]
-layout = sys.argv[5] if len(sys.argv) > 5 else "row"
-out_type = sys.argv[6] if len(sys.argv) > 6 else elem_type
+mr = int(args[0])
+nr = int(args[1])
+elem_type = args[2]
+arch = args[3]
+layout = args[4] if len(args) > 4 else "row"
+out_type = args[5] if len(args) > 5 else elem_type
 
 prefix = "gemm" # Default for mixed precision like i8->i32
 if elem_type == "f32" and out_type == "f32":
@@ -53,7 +67,7 @@ module {{
     %c_mem: memref<?x{out_type}>,
     %rs_c: index, %cs_c: index,
     %data: !llvm.ptr, %cntx: !llvm.ptr
-  ) attributes {{llvm.emit_c_interface, ukernel_layout = "{layout}"}} {{
+  ) attributes {{llvm.emit_c_interface, ukernel_layout = "{layout}", ukernel_alpha = "{opts['alpha']}", ukernel_beta = "{opts['beta']}", ukernel_edges = {opts['edges']}}} {{
 
     %alpha = memref.load %alpha_mem[] : memref<{out_type}>
     %beta  = memref.load %beta_mem[]  : memref<{out_type}>

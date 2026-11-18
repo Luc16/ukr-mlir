@@ -9,6 +9,9 @@ ARCH="haswell"
 LLVM_DIR=""
 LAYOUT="row"
 VEC_LEN=256
+ALPHA="dynamic"
+BETA="dynamic"
+EDGES="true"
 
 function usage() {
     echo "Usage: $0 [options]"
@@ -21,11 +24,14 @@ function usage() {
     echo "  -l <path>    Path to LLVM build directory"
     echo "  -L <string>  Layout (row or column, default: row)"
     echo "  -v <int>     Vector length in bits (default: 256)"
+    echo "  -A <kind>    alpha: one | dynamic (default: dynamic)"
+    echo "  -B <kind>    beta: zero | one | dynamic (default: dynamic)"
+    echo "  -E <bool>    Generate edge (masked) path: true | false (default: true)"
     echo "  -h           Help"
     exit 1
 }
 
-while getopts "m:n:p:a:l:o:L:v:h" opt; do
+while getopts "m:n:p:a:l:o:L:v:A:B:E:h" opt; do
     case $opt in
         m) MR=$OPTARG ;;
         n) NR=$OPTARG ;;
@@ -35,6 +41,9 @@ while getopts "m:n:p:a:l:o:L:v:h" opt; do
         o) OUTPUT_PRECISION=$OPTARG ;;
         L) LAYOUT=$OPTARG ;;
         v) VEC_LEN=$OPTARG ;;
+        A) ALPHA=$OPTARG ;;
+        B) BETA=$OPTARG ;;
+        E) EDGES=$OPTARG ;;
         h) usage ;;
         *) usage ;;
     esac
@@ -56,7 +65,7 @@ OBJ_NAME=$4
 
 echo "Generating $TYPE micro-kernel..."
 
-python3 scripts/blis_ukernel_generator.py $MR $NR $MLIR_TYPE $ARCH $LAYOUT $OUT_MLIR_TYPE > tmp/blis_ukernel_$TYPE.mlir
+python3 scripts/blis_ukernel_generator.py $MR $NR $MLIR_TYPE $ARCH $LAYOUT $OUT_MLIR_TYPE --alpha=$ALPHA --beta=$BETA --edges=$EDGES > tmp/blis_ukernel_$TYPE.mlir
 
 ./build/bin/transform-opt \
     -transform=test/ukernel_transform.mlir \

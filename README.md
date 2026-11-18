@@ -147,6 +147,26 @@ For testing mixed-precision workloads (e.g., `f16` or `bf16` inputs accumulating
 
 ---
 
+### 5. IREE Baseline (`iree_bench.py`)
+
+Compiles `linalg.matmul` with IREE's CPU backend under several configurations, checks the result against NumPy and reports the median GFLOP/s from `iree-benchmark-module`. Requires `pip install iree-base-compiler iree-base-runtime numpy`.
+
+**Example Command:**
+
+```bash
+python3 scripts/iree_bench.py --iree-bin /path/to/venv/bin -c A,B,D -s 256,512,1024 -o tmp/iree/results.csv
+```
+
+**Parameters:**
+- `-c A,B,D`: Configurations: `A` data tiling + codegen, `B` data tiling + IREE `mmt4d` ukernels, `D` Arm SME codegen (no data tiling).
+- `-s 256,512,1024`: Square sizes; use `--shapes-file` for a CSV of `M,N,K` lines.
+- `-p f32`: Element type (`f32`, `f16`).
+- `-t 1`: Threads (`1` uses `local-sync`, more uses `local-task`).
+- `-r 20`: Benchmark repetitions (median reported).
+- `--iree-bin`: Directory with the IREE tools (default: `$IREE_BIN` or `PATH`).
+
+---
+
 ## Project Structure
 
 - **`include/` & `lib/`**: Contains the C++ source code and MLIR TableGen definitions (`Ukernel.td`, `Ukernel.h`, `Ukernel.cpp`).

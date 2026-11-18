@@ -75,6 +75,14 @@ void Ukernel::init() {
     >();
 }
 
+// How alpha/beta are known when generating the kernel (func attrs ukernel_alpha / ukernel_beta).
+enum class ScalarKind { Dynamic, Zero, One };
+
+struct EpilogueConfig {
+  ScalarKind alpha = ScalarKind::Dynamic;
+  ScalarKind beta = ScalarKind::Dynamic;
+};
+
 UKernelInfo findUkernelDimensions(uint8_t aBitWidth, ArchInfo archInfo) {
   double elemPerVec = (double) archInfo.vec_len / (double) aBitWidth;
   uint32_t sRegs = (archInfo.is_risc) ? 3 : 2;
@@ -90,7 +98,7 @@ UKernelInfo findUkernelDimensions(uint8_t aBitWidth, ArchInfo archInfo) {
   return {mr, nr, 4, 0};
 }
 
-void generateVectorUkernel(OpBuilder &rewriter, Location loc, Value A, Value B, Value C, Type type, Type outType, uint32_t vecLen, UKernelInfo ukInfo, ArchInfo archInfo, BLISParams blisParams, bool isRowMajor = true, uint32_t wideningFactor = 1, bool isEdge = false) {
+void generateVectorUkernel(OpBuilder &rewriter, Location loc, Value A, Value B, Value C, Type type, Type outType, uint32_t vecLen, UKernelInfo ukInfo, ArchInfo archInfo, BLISParams blisParams, bool isRowMajor = true, uint32_t wideningFactor = 1, EpilogueConfig epilogue = {}, bool isEdge = false) {
 
   // if (isRowMajor && ukInfo.nr % vecLen != 0) {
   //   llvm::errs() << "Error: row-major layout requires nr to be a multiple of vector length.\n";
@@ -137,8 +145,11 @@ void generateVectorUkernel(OpBuilder &rewriter, Location loc, Value A, Value B, 
     outZeroVal = arith::ConstantOp::create(rewriter, loc, outType, rewriter.getFloatAttr(outType, 0.0));
   }
 
-  Value alpha = memref::LoadOp::create(rewriter, loc, blisParams.alpha_tensor, ValueRange{});
-  Value beta = memref::LoadOp::create(rewriter, loc, blisParams.beta_tensor, ValueRange{});
+  Value alpha, beta;
+  if (epilogue.alpha == ScalarKind::Dynamic)
+    alpha = memref::LoadOp::create(rewriter, loc, blisParams.alpha_tensor, ValueRange{});
+  if (epilogue.beta == ScalarKind::Dynamic)
+    beta = memref::LoadOp::create(rewriter, loc, blisParams.beta_tensor, ValueRange{});
 
   SmallVector<Value> masks;
   if (isEdge) {
@@ -320,76 +331,127 @@ void generateVectorUkernel(OpBuilder &rewriter, Location loc, Value A, Value B, 
   finalAccs.clear();
   for (int i = 0; i < accVars.size(); ++i) finalAccs.push_back(remLoop.getResults()[i]);
 
-  Value alphaBCast = vector::BroadcastOp::create(rewriter, loc, outVecTy, alpha);
-  Value betaBCast = vector::BroadcastOp::create(rewriter, loc, outVecTy, beta);
-  Value zeroBCast = vector::BroadcastOp::create(rewriter, loc, outVecTy, outZeroVal);
+  Value alphaBCast = (epilogue.alpha == ScalarKind::Dynamic) ? vector::BroadcastOp::create(rewriter, loc, outVecTy, alpha).getResult() : Value();
+  Value betaBCast = (epilogue.beta == ScalarKind::Dynamic) ? vector::BroadcastOp::create(rewriter, loc, outVecTy, beta).getResult() : Value();
+  bool isIntOut = isa<IntegerType>(outType);
 
-  if (!isEdge) {
-    for (int i = 0; i < outerDim; ++i) {
-      Value iIdx = arith::ConstantOp::create(rewriter, loc, rewriter.getIndexAttr(i));
-      Value i_rsc = arith::MulIOp::create(rewriter, loc, iIdx, strideC);
+  auto readC = [&](Value cOffset, int j) -> Value {
+    if (isEdge)
+      return vector::TransferReadOp::create(rewriter, loc, outVecTy, C, ValueRange{cOffset}, mapAttr1D, outZeroVal, masks[j], inBoundsAttrFlat);
+    return vector::TransferReadOp::create(rewriter, loc, outVecTy, C, ValueRange{cOffset}, outZeroVal, inBoundsFlat);
+  };
 
-      for (int j = 0; j < vecsPerLoop; ++j) {
-        Value jIdx = arith::ConstantOp::create(rewriter, loc, rewriter.getIndexAttr(j*vecLen));
-        Value cOffset = arith::AddIOp::create(rewriter, loc, i_rsc, jIdx);
+  auto writeC = [&](Value res, Value cOffset, int j) {
+    if (isEdge)
+      vector::TransferWriteOp::create(rewriter, loc, res, C, ValueRange{cOffset}, mapAttr1D, masks[j], inBoundsAttrFlat);
+    else
+      vector::TransferWriteOp::create(rewriter, loc, res, C, ValueRange{cOffset}, inBoundsFlat);
+  };
 
-        Value acc = vector::TransferReadOp::create(rewriter, loc, outVecTy, C, ValueRange{cOffset}, outZeroVal, inBoundsFlat);
+  // C = alpha * acc + beta * C. With beta == 0, C is never read (it may hold garbage/NaN).
+  auto scaleAndStore = [&](Value cOffset, int i, int j, ScalarKind betaKind) {
+    Value res = finalAccs[i*vecsPerLoop + j];
+    bool alphaOne = epilogue.alpha == ScalarKind::One;
+    Value c = (betaKind == ScalarKind::Zero) ? Value() : readC(cOffset, j);
 
-        Value scaledAcc;
-        Value scaledRes;
-        if (isa<IntegerType>(outType)) {
-          scaledAcc = arith::MulIOp::create(rewriter, loc, betaBCast, acc);
-          Value scaledResTmp = arith::MulIOp::create(rewriter, loc, alphaBCast, finalAccs[i*vecsPerLoop + j]);
-          scaledRes = arith::AddIOp::create(rewriter, loc, scaledAcc, scaledResTmp);
-        } else {
-          scaledAcc = vector::FMAOp::create(rewriter, loc, betaBCast, acc, zeroBCast);
-          scaledRes = vector::FMAOp::create(rewriter, loc, alphaBCast, finalAccs[i*vecsPerLoop + j], scaledAcc);
-        }
-
-          vector::TransferWriteOp::create(rewriter, loc, scaledRes, C, ValueRange{cOffset}, inBoundsFlat);
+    if (isIntOut) {
+      if (!alphaOne) res = arith::MulIOp::create(rewriter, loc, alphaBCast, res);
+      if (betaKind == ScalarKind::Dynamic) c = arith::MulIOp::create(rewriter, loc, betaBCast, c);
+      if (c) res = arith::AddIOp::create(rewriter, loc, c, res);
+    } else if (betaKind == ScalarKind::Zero) {
+      if (!alphaOne) res = arith::MulFOp::create(rewriter, loc, alphaBCast, res);
+    } else if (betaKind == ScalarKind::One) {
+      res = alphaOne ? arith::AddFOp::create(rewriter, loc, c, res).getResult()
+                     : vector::FMAOp::create(rewriter, loc, alphaBCast, res, c).getResult();
+    } else {
+      if (alphaOne) {
+        res = vector::FMAOp::create(rewriter, loc, betaBCast, c, res);
+      } else {
+        Value scaledC = arith::MulFOp::create(rewriter, loc, betaBCast, c);
+        res = vector::FMAOp::create(rewriter, loc, alphaBCast, res, scaledC);
       }
     }
-  } else {
-    for (int j = 0; j < vecsPerLoop; ++j) {
-      Value jIdx = arith::ConstantOp::create(rewriter, loc, rewriter.getIndexAttr(j*vecLen));
+
+    writeC(res, cOffset, j);
+  };
+
+  auto emitEpilogue = [&](ScalarKind betaKind) {
+    if (!isEdge) {
       for (int i = 0; i < outerDim; ++i) {
         Value iIdx = arith::ConstantOp::create(rewriter, loc, rewriter.getIndexAttr(i));
+        Value i_rsc = arith::MulIOp::create(rewriter, loc, iIdx, strideC);
 
-        Value cmpI = arith::CmpIOp::create(rewriter, loc, arith::CmpIPredicate::sgt, scalarDim, iIdx);
-
-        scf::IfOp calcDim = scf::IfOp::create(rewriter, loc, cmpI);
-        {
-          OpBuilder::InsertionGuard thenGuard(rewriter);
-          rewriter.setInsertionPointToStart(calcDim.thenBlock());
-
-          Value i_rsc = arith::MulIOp::create(rewriter, loc, iIdx, strideC);
-
+        for (int j = 0; j < vecsPerLoop; ++j) {
+          Value jIdx = arith::ConstantOp::create(rewriter, loc, rewriter.getIndexAttr(j*vecLen));
           Value cOffset = arith::AddIOp::create(rewriter, loc, i_rsc, jIdx);
+          scaleAndStore(cOffset, i, j, betaKind);
+        }
+      }
+    } else {
+      for (int j = 0; j < vecsPerLoop; ++j) {
+        Value jIdx = arith::ConstantOp::create(rewriter, loc, rewriter.getIndexAttr(j*vecLen));
+        for (int i = 0; i < outerDim; ++i) {
+          Value iIdx = arith::ConstantOp::create(rewriter, loc, rewriter.getIndexAttr(i));
 
-          Value acc = vector::TransferReadOp::create(rewriter, loc, outVecTy, C, ValueRange{cOffset}, mapAttr1D, outZeroVal, masks[j], inBoundsAttrFlat);
+          Value cmpI = arith::CmpIOp::create(rewriter, loc, arith::CmpIPredicate::sgt, scalarDim, iIdx);
 
-          Value scaledAcc;
-          Value scaledRes;
-          if (isa<IntegerType>(outType)) {
-            scaledAcc = arith::MulIOp::create(rewriter, loc, betaBCast, acc);
-            Value scaledResTmp = arith::MulIOp::create(rewriter, loc, alphaBCast, finalAccs[i*vecsPerLoop + j]);
-            scaledRes = arith::AddIOp::create(rewriter, loc, scaledAcc, scaledResTmp);
-          } else {
-            scaledAcc = vector::FMAOp::create(rewriter, loc, betaBCast, acc, zeroBCast);
-            scaledRes = vector::FMAOp::create(rewriter, loc, alphaBCast, finalAccs[i*vecsPerLoop + j], scaledAcc);
+          scf::IfOp calcDim = scf::IfOp::create(rewriter, loc, cmpI);
+          {
+            OpBuilder::InsertionGuard thenGuard(rewriter);
+            rewriter.setInsertionPointToStart(calcDim.thenBlock());
+
+            Value i_rsc = arith::MulIOp::create(rewriter, loc, iIdx, strideC);
+            Value cOffset = arith::AddIOp::create(rewriter, loc, i_rsc, jIdx);
+            scaleAndStore(cOffset, i, j, betaKind);
           }
-
-          vector::TransferWriteOp::create(rewriter, loc, scaledRes, C, ValueRange{cOffset}, mapAttr1D, masks[j], inBoundsAttrFlat);
         }
       }
     }
-  }
+  };
 
+  if (epilogue.beta == ScalarKind::Dynamic) {
+    // One branch for the whole tile instead of one per vector.
+    Value betaIsZero = isIntOut
+      ? arith::CmpIOp::create(rewriter, loc, arith::CmpIPredicate::eq, beta, outZeroVal).getResult()
+      : arith::CmpFOp::create(rewriter, loc, arith::CmpFPredicate::OEQ, beta, outZeroVal).getResult();
+
+    auto betaIf = scf::IfOp::create(rewriter, loc, betaIsZero, /*withElseRegion=*/true);
+    {
+      OpBuilder::InsertionGuard zeroGuard(rewriter);
+      rewriter.setInsertionPointToStart(betaIf.thenBlock());
+      emitEpilogue(ScalarKind::Zero);
+    }
+    {
+      OpBuilder::InsertionGuard dynGuard(rewriter);
+      rewriter.setInsertionPointToStart(betaIf.elseBlock());
+      emitEpilogue(ScalarKind::Dynamic);
+    }
+  } else {
+    emitEpilogue(epilogue.beta);
+  }
 }
 
 LogicalResult generateBLISUkernel(func::FuncOp blisFunc, OpBuilder &rewriter, ArchInfo archInfo) {
   if (blisFunc.getNumArguments() < 12) return failure();
   Location loc = blisFunc.getLoc();
+
+  bool useEdges = true;
+  if (auto edgesAttr = blisFunc->getAttrOfType<BoolAttr>("ukernel_edges"))
+    useEdges = edgesAttr.getValue();
+
+  EpilogueConfig epilogue;
+  for (auto [name, kind] : {std::pair<StringRef, ScalarKind *>{"ukernel_alpha", &epilogue.alpha},
+                            std::pair<StringRef, ScalarKind *>{"ukernel_beta", &epilogue.beta}}) {
+    auto attr = blisFunc->getAttrOfType<StringAttr>(name);
+    if (!attr || attr.getValue() == "dynamic") continue;
+    if (attr.getValue() == "one") *kind = ScalarKind::One;
+    else if (attr.getValue() == "zero" && name == "ukernel_beta") *kind = ScalarKind::Zero;
+    else {
+      emitError(loc) << "Error: invalid " << name << " = \"" << attr.getValue()
+                     << "\" (expected \"dynamic\", \"one\"" << (name == "ukernel_beta" ? " or \"zero\")." : ").");
+      return failure();
+    }
+  }
 
   blisFunc.eraseBody();
   Block *body = blisFunc.addEntryBlock();
@@ -444,25 +506,30 @@ LogicalResult generateBLISUkernel(func::FuncOp blisFunc, OpBuilder &rewriter, Ar
   }
   // }
 
+  if (useEdges) {
+    Value mr = arith::ConstantOp::create(rewriter, loc, rewriter.getIndexAttr(ukBest.mr)); 
+    Value nr = arith::ConstantOp::create(rewriter, loc, rewriter.getIndexAttr(ukBest.nr));
+    Value compMr = arith::CmpIOp::create(rewriter, loc, arith::CmpIPredicate::eq, mr, mVal);
+    Value compNr = arith::CmpIOp::create(rewriter, loc, arith::CmpIPredicate::eq, nr, nVal);
+    Value comp = arith::AndIOp::create(rewriter, loc, compMr, compNr);
 
-  Value mr = arith::ConstantOp::create(rewriter, loc, rewriter.getIndexAttr(ukBest.mr)); 
-  Value nr = arith::ConstantOp::create(rewriter, loc, rewriter.getIndexAttr(ukBest.nr));
-  Value compMr = arith::CmpIOp::create(rewriter, loc, arith::CmpIPredicate::eq, mr, mVal);
-  Value compNr = arith::CmpIOp::create(rewriter, loc, arith::CmpIPredicate::eq, nr, nVal);
-  Value comp = arith::AndIOp::create(rewriter, loc, compMr, compNr);
+    auto fastPath = scf::IfOp::create(rewriter, loc, comp, /*withElseRegion=*/true);
+    {
+      OpBuilder::InsertionGuard fastGuard(rewriter);
+      rewriter.setInsertionPointToStart(fastPath.thenBlock());
+      generateVectorUkernel(rewriter, loc, A, B, C_init, aType, cType, vecLen, ukBest, archInfo, blisParams, isRowMajor, wideningFactor, epilogue, false);
+    }
+    // Else Block
+    {
+      OpBuilder::InsertionGuard slowGuard(rewriter);
+      rewriter.setInsertionPointToStart(fastPath.elseBlock());
+      generateVectorUkernel(rewriter, loc, A, B, C_init, aType, cType, vecLen, ukBest, archInfo, blisParams, isRowMajor, wideningFactor, epilogue, true);
+    }
 
-  auto fastPath = scf::IfOp::create(rewriter, loc, comp, /*withElseRegion=*/true);
-  {
-    OpBuilder::InsertionGuard fastGuard(rewriter);
-    rewriter.setInsertionPointToStart(fastPath.thenBlock());
-    generateVectorUkernel(rewriter, loc, A, B, C_init, aType, cType, vecLen, ukBest, archInfo, blisParams, isRowMajor, wideningFactor, false);
+  } else {
+    generateVectorUkernel(rewriter, loc, A, B, C_init, aType, cType, vecLen, ukBest, archInfo, blisParams, isRowMajor, wideningFactor, epilogue, false);
   }
-  // Else Block
-  {
-    OpBuilder::InsertionGuard slowGuard(rewriter);
-    rewriter.setInsertionPointToStart(fastPath.elseBlock());
-    generateVectorUkernel(rewriter, loc, A, B, C_init, aType, cType, vecLen, ukBest, archInfo, blisParams, isRowMajor, wideningFactor, true);
-  }
+
 
   func::ReturnOp::create(rewriter, loc);
   return success();
