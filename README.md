@@ -89,6 +89,14 @@ This script drives the end-to-end generation and compilation pipeline for BLIS-c
 - `-v 256`: Vector register length in bits (e.g., `128`, `256`, `512`). Default is `256`.
 - `-l /path/to/llvm-project/build`: Path to compiled LLVM build directory (used to resolve `mlir-opt`, `mlir-translate`, and `llc`).
 
+**Generator options** (`blis_ukernel_generator.py`, after the positional arguments):
+- `--alpha=one|dynamic`, `--beta=zero|one|dynamic`, `--edges=true|false`: specialize the kernel (shell script: `-A`, `-B`, `-E`).
+- `--k-split=<n>`: number of independent accumulator sets the K loop alternates between (default: chosen by `transform-opt` so that FMA latency is hidden, within the register budget).
+- `--entry=bare`: also emit `<name>_tile(out, lhs, rhs, k)` taking bare pointers (output tile row-major, LHS panel `[K][MR]`, RHS panel `[K][NR]`); needs `--alpha=one` and a static beta. Run `mlir-opt -inline -canonicalize` first so the kernel and its memref descriptors fold into it.
+- `--name=<func>`: function name.
+
+**`transform-opt` target options:** `--vec-len` (bits), `--num-vecs` (vector registers, default `16`; `32` on AArch64), `--fma-units` and `--fma-latency` (default `2` and `5`; Apple M4: `4` and `4`). The last three decide the K split.
+
 ---
 
 ### 2. Standalone Micro-Kernel Validation (`run_standalone_ukernel.sh`)
@@ -164,6 +172,29 @@ python3 scripts/iree_bench.py --iree-bin /path/to/venv/bin -c A,B,D -s 256,512,1
 - `-t 1`: Threads (`1` uses `local-sync`, more uses `local-task`).
 - `-r 20`: Benchmark repetitions (median reported).
 - `--iree-bin`: Directory with the IREE tools (default: `$IREE_BIN` or `PATH`).
+
+---
+
+### 6. IREE Tile Comparison (`iree_tile_bench.sh`)
+
+Compares the generated micro-kernels with IREE's hand-written arm64 f32 `mmt4d` tile functions. IREE's ukernels are compiled straight from an IREE checkout (no IREE build needed); both run inside a copy of IREE's outer tile loop, called through IREE's tile-function signature. The ukr-mlir kernels are generated with `alpha = 1`, `beta = 0/1` (IREE's accumulate flag) and no edge handling, and called through their bare-pointer entry. For reference the harness also runs `ukr-v1` (MLIR C interface, no K split) and a BLIS-style 8x8 kernel. Plots: `.venv/bin/python plots/plot_iree_tile.py --runs <dir with run_*.csv> --out <dir>`.
+
+**Example Command:**
+
+```bash
+git clone --depth 1 https://github.com/iree-org/iree external/iree
+./scripts/iree_tile_bench.sh -l /path/to/llvm-project/build -o tmp/iree_tile/results.csv -- --k=64,256,1024 --reps=15
+```
+
+**Parameters:**
+- `-i <path>`: IREE source checkout (default: `external/iree`).
+- `-l <path>`: LLVM build directory (default: tools on `PATH`).
+- `-c <cpu>`: `-mcpu` used for both IREE's C and the ukr-mlir kernels (default: `native`).
+- `-r`, `-u`, `-t`: vector registers, FMA pipes and FMA latency passed to `transform-opt` (defaults `32`, `4`, `4`: Apple M4).
+- `-o <file>`: Also write the CSV to this file.
+- After `--`: `--k=` K values, `--modes=hot,warm,cold` (one tile in L1, an 8x8-tile problem reused, 8x8-tile problems cycled through a large arena), `--reps=` samples per kernel (median reported), `--sample-ms=` duration of each sample, `--check-only`.
+
+The harness checks every kernel against a reference first (NaN in the output when not accumulating), then measures the NEON FMA peak and reports GFLOP/s, % of peak and the median absolute deviation per kernel.
 
 ---
 

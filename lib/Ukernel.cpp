@@ -49,6 +49,24 @@ static llvm::cl::opt<uint32_t> clVecLen(
     llvm::cl::init(128) 
 );
 
+static llvm::cl::opt<uint32_t> clNumVecs(
+    "num-vecs",
+    llvm::cl::desc("Number of vector registers of the target (e.g. 32 for AArch64 NEON)."),
+    llvm::cl::init(16)
+);
+
+static llvm::cl::opt<uint32_t> clFmaUnits(
+    "fma-units",
+    llvm::cl::desc("Number of vector FMA pipes. With --fma-latency, sets how many independent accumulator chains the K loop needs."),
+    llvm::cl::init(2)
+);
+
+static llvm::cl::opt<uint32_t> clFmaLatency(
+    "fma-latency",
+    llvm::cl::desc("Latency in cycles of a dependent vector FMA."),
+    llvm::cl::init(5)
+);
+
 
 
 class Ukernel : public transform::TransformDialectExtension<Ukernel> {
@@ -95,7 +113,7 @@ UKernelInfo findUkernelDimensions(uint8_t aBitWidth, ArchInfo archInfo) {
   double nrows_d = std::floor(usedElems / ncols_d) - 1;
   uint8_t mr = static_cast<uint8_t>(nrows_d);
 
-  return {mr, nr, 4, 0};
+  return {mr, nr, 4, 0, 1};
 }
 
 void generateVectorUkernel(OpBuilder &rewriter, Location loc, Value A, Value B, Value C, Type type, Type outType, uint32_t vecLen, UKernelInfo ukInfo, ArchInfo archInfo, BLISParams blisParams, bool isRowMajor = true, uint32_t wideningFactor = 1, EpilogueConfig epilogue = {}, bool isEdge = false) {
@@ -215,9 +233,14 @@ void generateVectorUkernel(OpBuilder &rewriter, Location loc, Value A, Value B, 
   AffineMap map2D = AffineMap::getMinorIdentityMap(2, 1, rewriter.getContext());
   AffineMapAttr mapAttr2D = AffineMapAttr::get(map2D);
 
-  for (int i = 0; i < outerDim; ++i) {
-    for (int j = 0; j < vecsPerLoop; ++j) {
-      Value acc = vector::BroadcastOp::create(rewriter, loc, outVecTy, outZeroVal);      
+  // kSplit independent sets of accumulators: unrolled K step u updates set
+  // u % kSplit, so each accumulator register sees a dependent FMA only every
+  // kSplit steps. The sets are summed after the K loops.
+  const int numAccs = outerDim * vecsPerLoop;
+  const int kSplit = ukInfo.kSplit;
+  for (int s = 0; s < kSplit; ++s) {
+    for (int i = 0; i < numAccs; ++i) {
+      Value acc = vector::BroadcastOp::create(rewriter, loc, outVecTy, outZeroVal);
       accVars.push_back(acc);
     }
   }
@@ -299,7 +322,11 @@ void generateVectorUkernel(OpBuilder &rewriter, Location loc, Value A, Value B, 
     for (int u = 0; u < ukInfo.unroll; ++u) {
       Value uIdx = arith::ConstantOp::create(rewriter, loc, rewriter.getIndexAttr(u));
       Value k = arith::AddIOp::create(rewriter, loc, k_base, uIdx);
-      createKLoopBody(rewriter, loc, k, currentAccs);
+      int set = u % kSplit;
+      SmallVector<Value> setAccs(currentAccs.begin() + set * numAccs,
+                                 currentAccs.begin() + (set + 1) * numAccs);
+      createKLoopBody(rewriter, loc, k, setAccs);
+      std::copy(setAccs.begin(), setAccs.end(), currentAccs.begin() + set * numAccs);
     }
 
     SmallVector<Value> yieldOperands = currentAccs;
@@ -323,13 +350,31 @@ void generateVectorUkernel(OpBuilder &rewriter, Location loc, Value A, Value B, 
     SmallVector<Value> remAccs;
     for (int i = 0; i < accVars.size(); ++i) remAccs.push_back(remLoop.getRegionIterArgs()[i]);
 
-    createKLoopBody(rewriter, loc, k_rem, remAccs);
+    // The remainder (< unroll steps) only updates the first set.
+    SmallVector<Value> setAccs(remAccs.begin(), remAccs.begin() + numAccs);
+    createKLoopBody(rewriter, loc, k_rem, setAccs);
+    std::copy(setAccs.begin(), setAccs.end(), remAccs.begin());
     SmallVector<Value> remYieldOperands = remAccs;
     scf::YieldOp::create(rewriter, loc, remYieldOperands);
   }
 
   finalAccs.clear();
   for (int i = 0; i < accVars.size(); ++i) finalAccs.push_back(remLoop.getResults()[i]);
+
+  // Sum the accumulator sets pairwise: set s += set s + width.
+  for (int width = kSplit; width > 1; width = (width + 1) / 2) {
+    int half = (width + 1) / 2;
+    for (int s = 0; s + half < width; ++s) {
+      for (int i = 0; i < numAccs; ++i) {
+        Value &dst = finalAccs[s * numAccs + i];
+        Value src = finalAccs[(s + half) * numAccs + i];
+        dst = isa<IntegerType>(outType)
+                  ? arith::AddIOp::create(rewriter, loc, dst, src).getResult()
+                  : arith::AddFOp::create(rewriter, loc, dst, src).getResult();
+      }
+    }
+  }
+  finalAccs.resize(numAccs);
 
   Value alphaBCast = (epilogue.alpha == ScalarKind::Dynamic) ? vector::BroadcastOp::create(rewriter, loc, outVecTy, alpha).getResult() : Value();
   Value betaBCast = (epilogue.beta == ScalarKind::Dynamic) ? vector::BroadcastOp::create(rewriter, loc, outVecTy, beta).getResult() : Value();
@@ -506,8 +551,30 @@ LogicalResult generateBLISUkernel(func::FuncOp blisFunc, OpBuilder &rewriter, Ar
   }
   // }
 
+  // Narrow tiles have too few accumulators to hide the FMA latency
+  // (fma-units * fma-latency independent chains are needed), so split K over
+  // several accumulator sets, as far as the vector registers allow.
+  // ukernel_k_split on the function overrides the choice.
+  uint32_t numAccs = isRowMajor ? ukBest.mr * (ukBest.nr / vecLen) : ukBest.nr * (ukBest.mr / vecLen);
+  uint32_t vecsPerStep = isRowMajor ? ukBest.nr / vecLen : ukBest.mr / vecLen;
+  uint32_t chainsNeeded = archInfo.n_fmacs * archInfo.lat_fmacs;
+  int64_t regBudget = (int64_t)archInfo.num_vecs - vecsPerStep - 2;
+  uint32_t kSplit = 1;
+  while (kSplit < 8 && kSplit * numAccs < chainsNeeded && 2 * kSplit * numAccs <= regBudget)
+    kSplit *= 2;
+  if (auto splitAttr = blisFunc->getAttrOfType<IntegerAttr>("ukernel_k_split")) {
+    if (splitAttr.getInt() < 1 || splitAttr.getInt() > 16) {
+      emitError(loc) << "Error: ukernel_k_split must be in [1, 16], got " << splitAttr.getInt() << ".";
+      return failure();
+    }
+    kSplit = splitAttr.getInt();
+  }
+  ukBest.kSplit = kSplit;
+  // Every set must get the same number of unrolled steps.
+  ukBest.unroll = kSplit * ((ukBest.unroll + kSplit - 1) / kSplit);
+
   if (useEdges) {
-    Value mr = arith::ConstantOp::create(rewriter, loc, rewriter.getIndexAttr(ukBest.mr)); 
+    Value mr = arith::ConstantOp::create(rewriter, loc, rewriter.getIndexAttr(ukBest.mr));
     Value nr = arith::ConstantOp::create(rewriter, loc, rewriter.getIndexAttr(ukBest.nr));
     Value compMr = arith::CmpIOp::create(rewriter, loc, arith::CmpIPredicate::eq, mr, mVal);
     Value compNr = arith::CmpIOp::create(rewriter, loc, arith::CmpIPredicate::eq, nr, nVal);
@@ -546,10 +613,10 @@ transform::UkernelOp::apply(transform::TransformRewriter &rewriter,
   ArchInfo archInfo = {
     .l1_size = 192 * 1024,
     .vec_len = clVecLen,
-    .num_vecs = 16,
+    .num_vecs = clNumVecs,
     .is_risc = 1,
-    .n_fmacs = 2,
-    .lat_fmacs = 5,
+    .n_fmacs = clFmaUnits,
+    .lat_fmacs = clFmaLatency,
   };
 
   for (Operation *op : payloadOps) {

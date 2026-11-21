@@ -173,6 +173,7 @@ typedef struct {
   uint8_t nr;
   uint8_t unroll;
   uint32_t kc;
+  uint8_t kSplit;  // independent accumulator sets the K loop alternates between
 } UKernelInfo;
 
 
